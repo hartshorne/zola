@@ -69,23 +69,18 @@ You can add more accounts later by using the `--account` flag with a new account
 
 ## Labels
 
-Zola uses a hierarchical labeling system to organize your inbox:
+Zola uses a hierarchical labeling system to organize your inbox. All labels are prefixed with `zola/`:
 
 ### Standard Labels
 
-All standard labels are prefixed with `zola/`:
-
-- **priority**: For urgent items requiring immediate attention, including:
-  - Messages from family members
-  - Imminent deadlines or bills
-  - Urgent meetings (today/tomorrow)
-  - Messages from historically quick-response contacts
-- **respond**: For emails needing a reply or follow-up
-- **review**: For non-urgent items to read when time permits
-- **finance**: For financial matters like invoices, bills, and expenses
-- **travel**: For travel-related emails and bookings
-
-Labels can be combined when appropriate (e.g., `priority` + `finance` for an urgent bill).
+- **priority**: For emails needing immediate attention, such as urgent messages, near-due bills, or emails from key contacts.
+- **respond**: For emails that require a reply or follow-up. Can also be marked as `priority` if urgent.
+- **review**: For emails to be read or reviewed later; not urgent and not requiring a response.
+- **finance**: For financial matters like invoices, bills, expenses, and taxes. Can be marked as `priority` if urgent.
+- **travel**: For travel-related emails, including bookings, itineraries, and confirmations. Use `priority` if time-sensitive.
+- **school**: For school communications, such as updates, announcements, and deadlines. Mark as `priority` if urgent.
+- **newsletters**: For regular updates like newsletters and informational digests.
+- **ignore**: For low-priority bulk emails, including sales outreach, surveys, promotional content, or automated notifications. **When this label is applied, no other labels should be used.**
 
 ### System Labels
 
@@ -96,7 +91,7 @@ System labels are prefixed with `zola/🤖/` and indicate processing status:
 
 ### Response Time Categories
 
-Zola checks the timestamps in your sent folder to see how quickly you usually reply. It then adjusts the priority of incoming emails based on this average to help the LLM spot important messages:
+Zola tracks your typical response times to help prioritize incoming emails:
 
 - **immediate**: within 30 minutes
 - **quick**: within 2 hours
@@ -104,7 +99,7 @@ Zola checks the timestamps in your sent folder to see how quickly you usually re
 - **next_day**: within 24 hours
 - **delayed**: longer than 24 hours
 
-These patterns are tracked both per-sender and per-domain to help gauge message urgency.
+These categories are based on your historical reply times per sender and domain, assisting the LLM in assessing the urgency of each email.
 
 ## Usage
 
@@ -125,7 +120,7 @@ Zola provides a command-line interface with the following options:
 Zola will:
 
 1. Process Sent messages to build SLA (reply time) data and save average SLA per domain to `secrets/sla/{account_name}.json`.
-2. Process Inbox messages and apply labels based on the LLM's output and SLA adjustments.
+2. Process Inbox messages and apply labels based on the LLM’s output and SLA adjustments.
 
 ## Running Zola
 

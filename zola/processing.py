@@ -410,6 +410,12 @@ async def process_inbox_message(
             if label.startswith(double_prefix):
                 label = label.replace(double_prefix, f"{PARENT_LABEL}/", 1)
             final_labels.append(label)
+
+        # If 'ignore' is present, return only that label
+        for label in final_labels:
+            if label.lower() == f"{PARENT_LABEL.lower()}/ignore":
+                return [label]
+
         return final_labels
     except Exception as e:
         logger.error("Error processing message %s: %s", msg_id, str(e), exc_info=True)

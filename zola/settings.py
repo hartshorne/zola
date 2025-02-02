@@ -22,23 +22,18 @@ ERROR_LABELS = {
 # All standard labels for classification
 STANDARD_LABELS = {
     "priority": (
-        "For items requiring immediate attention, such as:\n"
-        "  * Messages from people sharing your family name (`{user_family_name}`)\n"
-        "  * Invoices/bills due within 5 days\n"
-        "  * Meeting invites for today or tomorrow\n"
-        "  * Urgent requests from key contacts\n"
-        "  * Travel bookings needing immediate action\n"
-        "  * Messages from senders you typically respond to quickly (`{sender_category}`)"
+        "For emails needing immediate attention. This may include urgent messages, near-due bills, quick meeting invites, "
+        "critical requests, travel bookings needing attention, or emails from key contacts and familiar senders (`{sender_category}`/`{user_family_name}`)."
     ),
-    "respond": ("For emails that need a reply or follow-up.\nCan be combined with 'priority' if urgent."),
-    "review": ("For items to read or review when time permits.\nNot immediately urgent or requiring a response."),
-    "finance": (
-        "For invoices, bills, expenses, and other financial matters.\n"
-        "Can be combined with 'priority' if due soon or urgent."
-    ),
-    "travel": (
-        "For travel-related emails (bookings, itineraries, confirmations).\n"
-        "Can be combined with 'priority' if departure is imminent."
+    "respond": "For emails that need a reply or follow-up; can also be 'priority' if urgent.",
+    "review": "For emails to be read or reviewed later; not urgent and not requiring a response.",
+    "finance": "For financial matters such as invoices, bills, expenses, and taxes; can be 'priority' if urgent.",
+    "travel": "For travel-related emails like bookings, itineraries, and confirmations; use 'priority' if time-sensitive.",
+    "school": "For school communications including updates, announcements, and deadlines; mark as 'priority' if urgent.",
+    "newsletters": "For regular updates such as newsletters and informational digests.",
+    "ignore": (
+        "For low-priority bulk emails like sales outreach, surveys, promotional content, or automated notifications. "
+        "When this label is applied, no other labels should be used."
     ),
 }
 
@@ -102,30 +97,31 @@ SLA_SECTION = generate_sla_markdown(SLA_CATEGORIES)
 
 # LLM prompt template that uses the labels markdown and SLA explanation
 LLM_CONTEXT_TEMPLATE = f"""You are an elite executive assistant helping to organize an inbox using a simple but effective labeling system.
-Your task is to analyze each email and apply one or more of these labels:
+Your task is to analyze each email and apply one or more of these labels relevant to prioritizing the email:
 
-Available labels (can apply multiple):
+Available labels (apply multiple if needed):
 {LABELS_SECTION}
 
+SLA Details:
 {SLA_SECTION}
 
 Priority Guidelines:
-- Consider today's date ({{today_date}}) when deciding urgency
-- Messages from people with your family name ({{user_family_name}}) should be priority
-- Consider the sender's typical response time ({{sender_category}})
-- Evaluate domain-level patterns ({{domain_category}})
+- Consider today's date ({{today_date}}) when assessing urgency.
+- Emails from people with your family name ({{user_family_name}}) should be high priority.
+- Evaluate typical response times ({{sender_category}}) as well as domain-level patterns ({{domain_category}}).
 
-Return ONLY a Python list of labels, e.g.: ['priority', 'finance']
-
-Email Context:
+Email Context (provided solely for analysis):
   From: {{from_header}}
   Subject: {{subject}}
   Received: {{received_age}} ago
-  Response Pattern for sender: {{sender_category}}
-  Response Pattern for {{sender_domain}}: {{domain_category}}
+  Sender's response pattern: {{sender_category}}
+  Domain response pattern: {{domain_category}}
 
 Email Body:
 {{email_body}}
+
+**IMPORTANT**: Do not include or echo any part of the email context or body in your response.
+Return ONLY a Python list of labels, for example: ['priority', 'finance'].
 """
 
 # Default SLA in seconds (1 hour)

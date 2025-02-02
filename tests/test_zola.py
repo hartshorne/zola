@@ -427,11 +427,39 @@ class TestProcessing(unittest.IsolatedAsyncioTestCase):
 
         mock_sla_data = MockSLAData()
         test_cases = [
-            (["priority", "respond"], [f"{PARENT_LABEL}/priority", f"{PARENT_LABEL}/respond"]),
+            (
+                ["priority", "respond"],
+                [f"{PARENT_LABEL}/priority", f"{PARENT_LABEL}/respond"],
+            ),
             ([f"{LLM_PARENT_LABEL}/confused"], [f"{LLM_PARENT_LABEL}/confused"]),
             ([f"{PARENT_LABEL}/priority"], [f"{PARENT_LABEL}/priority"]),
-            ([f"{PARENT_LABEL}/{LLM_PARENT_LABEL}/confused"], [f"{LLM_PARENT_LABEL}/confused"]),
+            (
+                [f"{PARENT_LABEL}/{LLM_PARENT_LABEL}/confused"],
+                [f"{LLM_PARENT_LABEL}/confused"],
+            ),
+            # Test cases for school and newsletters
+            (["school"], [f"{PARENT_LABEL}/school"]),
+            (
+                ["school", "priority"],
+                [f"{PARENT_LABEL}/school", f"{PARENT_LABEL}/priority"],
+            ),  # school can combine with priority
+            (["newsletters"], [f"{PARENT_LABEL}/newsletters"]),
+            # Test cases for ignore label
+            (["ignore"], [f"{PARENT_LABEL}/ignore"]),
+            (
+                ["ignore", "priority"],
+                [f"{PARENT_LABEL}/ignore"],
+            ),  # ignore should override other labels
+            (
+                ["ignore", "newsletters"],
+                [f"{PARENT_LABEL}/ignore"],
+            ),  # ignore should override newsletters too
+            (
+                [f"{PARENT_LABEL}/ignore", "priority"],
+                [f"{PARENT_LABEL}/ignore"],
+            ),  # ignore should override even when prefixed
         ]
+
         for llm_output, expected_labels in test_cases:
             with self.subTest(llm_output=llm_output):
                 mock_classify_email.return_value = llm_output
@@ -449,6 +477,12 @@ class TestProcessing(unittest.IsolatedAsyncioTestCase):
                         self.fail(f"Label {label} has double prefix")
                     if f"/{PARENT_LABEL}/" in label and label.count(PARENT_LABEL) > 1:
                         self.fail(f"Label {label} has nested parent label")
+                    if "ignore" in label:
+                        self.assertEqual(
+                            len(result),
+                            1,
+                            f"'ignore' label should be used alone, got: {result}",
+                        )
 
 
 if __name__ == "__main__":
