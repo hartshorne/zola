@@ -1,0 +1,7 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "include": ["zola", "tests"],
+  "exclude": [".venv", ".git"],
+  "reportMissingImports": true
+}
