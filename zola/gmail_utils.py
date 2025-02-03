@@ -1,82 +1,217 @@
+from __future__ import annotations
+
 import asyncio
 import base64
+import contextlib
 import email.utils
 import logging
 import os
 import re
 import tempfile
-import time
 import zoneinfo
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import tenacity
 from aiogoogle.client import Aiogoogle
+from aiolimiter import AsyncLimiter
 from markitdown import MarkItDown
 
+# Local application imports
 from zola.settings import ALL_LABELS, LLM_PARENT_LABEL, PARENT_LABEL
 
 logger = logging.getLogger(__name__)
 
-# Precompile the email regex pattern for efficiency.
-EMAIL_REGEX = re.compile(
-    r"[a-zA-Z0-9.+_-]+@([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*)"
-)
+EMAIL_REGEX = re.compile(r"[a-zA-Z0-9.+_-]+@([a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,})")
+
+# Create a module-wide async limiter for ~100 calls per second
+rate_limiter = AsyncLimiter(100, 1.0)
 
 
-class RateLimiter:
-    """
-    Asynchronous rate limiter that spreads out calls evenly, enforcing:
-      * at most max_calls over 'period' seconds
-      * i.e., a minimum delay of (period / max_calls) between consecutive calls
-    """
+async def get_gmail_service(aiogoogle: Aiogoogle) -> Any:
+    """Return the Gmail API service."""
+    return await aiogoogle.discover("gmail", "v1")
 
-    def __init__(self, max_calls: int, period: float) -> None:
-        self.max_calls = max_calls
-        self.period = period
-        self.min_interval = self.period / self.max_calls  # e.g. 1/100 = 0.01
-        self.lock = asyncio.Lock()
-        self.last_call_time: Optional[float] = None  # NOTE: Explicit type annotation.
 
-    async def __aenter__(self) -> None:
-        async with self.lock:
-            now = time.monotonic()
-            if self.last_call_time is None:
-                self.last_call_time = now
-                return
-            elapsed = now - self.last_call_time
-            if elapsed < self.min_interval:
-                await asyncio.sleep(self.min_interval - elapsed)
-            self.last_call_time = time.monotonic()
+def decode_base64url(data: str) -> bytes:
+    """Decode a base64url-encoded string, adding any missing padding."""
+    if not data:
+        return b""
+    data = data.replace("-", "+").replace("_", "/")
+    missing_padding = len(data) % 4
+    if missing_padding:
+        data += "=" * (4 - missing_padding)
+    return base64.b64decode(data)
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
+
+def extract_text_content(msg: Dict[str, Any]) -> str:
+    """Recursively extract text content from an email message part."""
+    if not msg:
+        return ""
+    mime_type = msg.get("mimeType", "")
+    if mime_type.startswith("text/") and not msg.get("filename"):
+        body_data = msg.get("body", {}).get("data")
+        if body_data:
+            try:
+                return decode_base64url(body_data).decode("utf-8", errors="replace")
+            except Exception as e:
+                logger.warning("Failed to decode message body: %s", e)
+                return ""
+    for part in msg.get("parts", []):
+        content = extract_text_content(part)
+        if content:
+            return content
+    return ""
+
+
+def extract_email_domain(header_value: str) -> str:
+    """Extract the email domain from a header string."""
+    text_without_brackets = re.sub(r"<[^>]*>", "", header_value)
+    if text_without_brackets.count("@") > 1:
+        return "unknown"
+    match = EMAIL_REGEX.search(header_value)
+    if not match:
+        return "unknown"
+    return match.group(1).lower()
+
+
+def parse_date(date_str: str) -> datetime:
+    """Parse an RFC2822 date string into a datetime object (UTC if naive)."""
+    dt = email.utils.parsedate_to_datetime(date_str)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def get_user_timezone() -> str:
+    """Get the user's timezone from environment or system files; fall back to UTC."""
+    tz = os.environ.get("TZ")
+    if tz:
+        try:
+            zoneinfo.ZoneInfo(tz)
+            return tz
+        except zoneinfo.ZoneInfoNotFoundError:
+            pass
+
+    try:
+        timezone_file = Path("/etc/timezone")
+        if timezone_file.exists():
+            tz_candidate = timezone_file.read_text().strip()
+            if tz_candidate:
+                zoneinfo.ZoneInfo(tz_candidate)
+                return tz_candidate
+    except zoneinfo.ZoneInfoNotFoundError:
         pass
 
+    try:
+        localtime = Path("/etc/localtime")
+        if localtime.exists():
+            target = os.path.realpath(localtime)
+            if "zoneinfo" in target:
+                tz_candidate = target.split("zoneinfo/")[-1].split("zoneinfo.default/")[-1]
+                tz_candidate = tz_candidate.lstrip("/")
+                if tz_candidate in zoneinfo.available_timezones():
+                    return tz_candidate
+    except (OSError, zoneinfo.ZoneInfoNotFoundError):
+        pass
 
-# Create a module-wide rate limiter for ~100 calls per second.
-rate_limiter = RateLimiter(100, 1.0)
+    logger.warning("Could not determine user timezone, falling back to UTC")
+    return "UTC"
 
 
-async def list_messages(aiogoogle: Aiogoogle, label: str, max_messages: int = 1000) -> List[Dict[str, Any]]:
+def convert_to_user_timezone(dt: datetime) -> datetime:
+    """Convert a datetime to the user's local timezone."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    user_tz = zoneinfo.ZoneInfo(get_user_timezone())
+    return dt.astimezone(user_tz)
+
+
+def format_datetime_for_model(dt: datetime) -> str:
+    """Format a datetime consistently for model context."""
+    local_dt = convert_to_user_timezone(dt)
+    return local_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+@contextlib.contextmanager
+def temporary_file(suffix: Optional[str] = None) -> str:
     """
-    Retrieves up to max_messages message metadata for a given Gmail label.
+    Synchronous context manager for a temporary file that cleans up after use.
+    Returns the path of the temporary file.
     """
-    messages = []
-    gmail = await aiogoogle.discover("gmail", "v1")
-    response = await aiogoogle.as_user(gmail.users.messages.list(userId="me", labelIds=[label], maxResults=500))
+    f = tempfile.NamedTemporaryFile(mode="w+b", suffix=suffix, delete=False)
+    try:
+        yield f.name
+    finally:
+        try:
+            f.close()
+        except Exception:
+            pass
+        temp_path = Path(f.name)
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except Exception as e:
+                logger.warning("Failed to remove temporary file %s: %s", temp_path, e)
+
+
+@asynccontextmanager
+async def async_temporary_file(suffix: Optional[str] = None) -> str:
+    """
+    Asynchronous context manager for a temporary file.
+    It creates a temporary file (using a thread pool for blocking I/O),
+    yields its path, and ensures cleanup on exit.
+    """
+
+    def create_temp():
+        f = tempfile.NamedTemporaryFile(mode="w+b", suffix=suffix, delete=False)
+        return f.name, f
+
+    tmp_path, f = await asyncio.to_thread(create_temp)
+    try:
+        yield tmp_path
+    finally:
+        await asyncio.to_thread(f.close)
+
+        def unlink_temp():
+            try:
+                Path(tmp_path).unlink()
+            except Exception as e:
+                logger.warning("Failed to remove temporary file %s: %s", tmp_path, e)
+
+        await asyncio.to_thread(unlink_temp)
+
+
+async def list_messages(
+    aiogoogle: Aiogoogle,
+    label: str,
+    max_messages: int = 1000,
+) -> List[Dict[str, Any]]:
+    """Retrieve up to max_messages from Gmail under a particular label."""
+    messages: List[Dict[str, Any]] = []
+    gmail = await get_gmail_service(aiogoogle)
+
+    async with rate_limiter:
+        response = await aiogoogle.as_user(gmail.users.messages.list(userId="me", labelIds=[label], maxResults=500))
+
     if "messages" in response:
         messages.extend(response["messages"])
+
     while "nextPageToken" in response and len(messages) < max_messages:
         page_token = response["nextPageToken"]
-        response = await aiogoogle.as_user(
-            gmail.users.messages.list(
-                userId="me",
-                labelIds=[label],
-                pageToken=page_token,
-                maxResults=500,
+        async with rate_limiter:
+            response = await aiogoogle.as_user(
+                gmail.users.messages.list(
+                    userId="me",
+                    labelIds=[label],
+                    pageToken=page_token,
+                    maxResults=500,
+                )
             )
-        )
         messages.extend(response.get("messages", []))
+
     return messages[:max_messages]
 
 
@@ -86,23 +221,20 @@ async def get_message(
     format: str = "full",
     metadata_headers: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """
-    Retrieves a Gmail message by ID.
-    """
-    gmail = await aiogoogle.discover("gmail", "v1")
+    """Retrieve a single Gmail message by ID."""
+    gmail = await get_gmail_service(aiogoogle)
+    params: Dict[str, Any] = {"userId": "me", "id": msg_id, "format": format}
+    if format == "metadata" and metadata_headers:
+        params["metadataHeaders"] = metadata_headers
+
     async with rate_limiter:
-        params = {"userId": "me", "id": msg_id, "format": format}
-        if format == "metadata" and metadata_headers:
-            params["metadataHeaders"] = metadata_headers
         message = await aiogoogle.as_user(gmail.users.messages.get(**params))
     return message
 
 
 async def get_attachment(aiogoogle: Aiogoogle, msg_id: str, attachment_id: str) -> bytes:
-    """
-    Downloads an attachment from a Gmail message.
-    """
-    gmail = await aiogoogle.discover("gmail", "v1")
+    """Download an attachment from Gmail."""
+    gmail = await get_gmail_service(aiogoogle)
     async with rate_limiter:
         attachment = await aiogoogle.as_user(
             gmail.users.messages.attachments.get(userId="me", messageId=msg_id, id=attachment_id)
@@ -112,14 +244,7 @@ async def get_attachment(aiogoogle: Aiogoogle, msg_id: str, attachment_id: str) 
 
 
 def get_message_attachments(message: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    Extracts attachment metadata from a full Gmail message.
-    Returns a list of dictionaries for each attachment with:
-      - filename: The attachment's filename (or 'untitled' if not provided)
-      - mimeType: The MIME type
-      - size: Size in bytes
-      - attachmentId: ID required to download the attachment
-    """
+    """Extract metadata for attachments from a Gmail message."""
     attachments: List[Dict[str, Any]] = []
 
     def process_parts(parts: List[Dict[str, Any]]) -> None:
@@ -145,235 +270,156 @@ def get_message_attachments(message: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 async def get_or_create_label(aiogoogle: Aiogoogle, label_name: str) -> str:
     """
-    Ensures a Gmail label exists and returns its ID.
-    Creates nested labels under 'zola' parent label.
-    Only creates labels that are defined in ALL_LABELS.
+    Ensure a Gmail label exists, or create it if not found.
+    Returns the label's ID.
     """
-    if label_name not in ALL_LABELS and not label_name == PARENT_LABEL:
+    if label_name not in ALL_LABELS and label_name != PARENT_LABEL:
         raise ValueError(f"Invalid label name: {label_name}")
 
-    gmail = await aiogoogle.discover("gmail", "v1")
+    # First try to find existing label
+    existing_id = await find_label_by_name(aiogoogle, label_name)
+    if existing_id:
+        return existing_id
 
-    # First check if the label already exists (case-insensitive)
-    response = await aiogoogle.as_user(gmail.users.labels.list(userId="me"))
+    # Create parent label if needed
+    if label_name.startswith(f"{PARENT_LABEL}/"):
+        await ensure_parent_label_exists(aiogoogle)
+
+    # Create the requested label
+    return await create_label(aiogoogle, label_name)
+
+
+async def find_label_by_name(aiogoogle: Aiogoogle, label_name: str) -> Optional[str]:
+    """Find a Gmail label by name and return its ID if found."""
+    gmail = await get_gmail_service(aiogoogle)
+    async with rate_limiter:
+        response = await aiogoogle.as_user(gmail.users.labels.list(userId="me"))
+
     for label in response.get("labels", []):
         if label.get("name", "").lower() == label_name.lower():
             logger.debug("Found existing label '%s' with ID: %s", label_name, label.get("id"))
             return label.get("id")
+    return None
 
-    # If it's a nested label, ensure parent exists first
-    if label_name.startswith(f"{PARENT_LABEL}/"):
-        parent_name = PARENT_LABEL
-        parent_label_id = None
-        for label in response.get("labels", []):
-            if label.get("name", "").lower() == parent_name.lower():
-                parent_label_id = label.get("id")
-                logger.debug(
-                    f"Found existing parent label '{PARENT_LABEL}' with ID: %s",
-                    parent_label_id,
-                )
-                break
-        if not parent_label_id:
-            logger.info("Creating parent label: %s", parent_name)
-            try:
-                parent_response = await aiogoogle.as_user(
-                    gmail.users.labels.create(
-                        userId="me",
-                        json={
-                            "name": parent_name,
-                            "labelListVisibility": "labelShow",
-                            "messageListVisibility": "show",
-                            "type": "user",
-                            "color": {
-                                "backgroundColor": "#666666",
-                                "textColor": "#ffffff",
-                            },
-                        },
-                    )
-                )
-                parent_label_id = parent_response.get("id")
-                logger.info("Created parent label 'zola' with ID: %s", parent_label_id)
-            except Exception as e:
-                if "Label name exists or conflicts" in str(e):
-                    # Try to fetch the existing label again
-                    response = await aiogoogle.as_user(gmail.users.labels.list(userId="me"))
-                    for label in response.get("labels", []):
-                        if label.get("name", "").lower() == parent_name.lower():
-                            parent_label_id = label.get("id")
-                            logger.debug("Found parent label after conflict: %s", parent_label_id)
-                            break
-                if not parent_label_id:
-                    raise
 
-    # Create the new label
+async def ensure_parent_label_exists(aiogoogle: Aiogoogle) -> None:
+    """Ensure the parent label exists, creating it if needed."""
+    parent_id = await find_label_by_name(aiogoogle, PARENT_LABEL)
+    if not parent_id:
+        logger.info("Creating parent label: %s", PARENT_LABEL)
+        try:
+            await create_label(aiogoogle, PARENT_LABEL)
+        except Exception as e:
+            if "Label name exists or conflicts" not in str(e):
+                raise
+
+
+async def create_label(aiogoogle: Aiogoogle, label_name: str) -> str:
+    """Create a new Gmail label and return its ID."""
+    gmail = await get_gmail_service(aiogoogle)
     logger.info("Creating new Gmail label: %s", label_name)
+
     try:
-        create_response = await aiogoogle.as_user(
-            gmail.users.labels.create(
-                userId="me",
-                json={
-                    "name": label_name,
-                    "labelListVisibility": "labelShow",
-                    "messageListVisibility": "show",
-                    "type": "user",
-                    "color": {"backgroundColor": "#666666", "textColor": "#ffffff"},
-                },
+        async with rate_limiter:
+            create_response = await aiogoogle.as_user(
+                gmail.users.labels.create(
+                    userId="me",
+                    json={
+                        "name": label_name,
+                        "labelListVisibility": "labelShow",
+                        "messageListVisibility": "show",
+                        "type": "user",
+                        "color": {"backgroundColor": "#666666", "textColor": "#ffffff"},
+                    },
+                )
             )
-        )
         new_label_id = create_response.get("id")
         logger.info("Successfully created new label '%s' with ID: %s", label_name, new_label_id)
         return new_label_id
+
     except Exception as e:
         if "Label name exists or conflicts" in str(e):
-            # Try to fetch the existing label one more time
-            response = await aiogoogle.as_user(gmail.users.labels.list(userId="me"))
-            for label in response.get("labels", []):
-                if label.get("name", "").lower() == label_name.lower():
-                    logger.debug(
-                        "Found label after conflict: %s with ID: %s",
-                        label_name,
-                        label.get("id"),
-                    )
-                    return label.get("id")
+            existing_id = await find_label_by_name(aiogoogle, label_name)
+            if existing_id:
+                return existing_id
         raise
 
 
+@tenacity.retry(
+    stop=tenacity.stop_after_attempt(5),
+    wait=tenacity.wait_exponential(multiplier=1.0),
+    reraise=True,
+)
 async def update_message_labels(
     aiogoogle: Aiogoogle,
     msg_id: str,
     label_ids: List[str],
     label_names: List[str],
-    max_retries: int = 5,
 ) -> bool:
-    """
-    Adds a list of label IDs to a Gmail message, with exponential backoff retry.
-    Returns True if labels were successfully applied, False otherwise.
-    """
-    gmail = await aiogoogle.discover("gmail", "v1")
-    backoff = 1  # initial backoff in seconds
-    for attempt in range(max_retries):
-        logger.debug(
-            "Attempting to update message %s with label IDs %s (attempt %d/%d)",
-            msg_id,
-            label_ids,
-            attempt + 1,
-            max_retries,
-        )
-        try:
-            if not label_ids:
-                logger.warning("No label IDs provided for message %s", msg_id)
-                return False
+    """Add label IDs to a Gmail message, retrying on failure."""
+    if not label_ids:
+        logger.warning("No label IDs provided for message %s", msg_id)
+        return False
 
-            response = await aiogoogle.as_user(
-                gmail.users.messages.modify(
-                    userId="me",
-                    id=msg_id,
-                    json={"addLabelIds": label_ids, "removeLabelIds": []},
-                )
+    gmail = await get_gmail_service(aiogoogle)
+    async with rate_limiter:
+        response = await aiogoogle.as_user(
+            gmail.users.messages.modify(
+                userId="me",
+                id=msg_id,
+                json={"addLabelIds": label_ids, "removeLabelIds": []},
             )
+        )
 
-            # Log the response details
-            if response and "labelIds" in response:
-                applied_labels = set(response["labelIds"])
-                requested_labels = set(label_ids)
-                if requested_labels.issubset(applied_labels):
-                    logger.debug(
-                        "Gmail API confirmed labels were applied to message %s:\nRequested: %s\nCurrent labels: %s",
-                        msg_id,
-                        label_names,
-                        response["labelIds"],
-                    )
-                    return True
-                else:
-                    missing_labels = requested_labels - applied_labels
-                    logger.warning(
-                        "Some requested labels were not applied to message %s:\nMissing: %s\nCurrent labels: %s",
-                        msg_id,
-                        [lid for lid in label_ids if lid in missing_labels],
-                        response["labelIds"],
-                    )
-                    return False
-            else:
-                logger.warning(
-                    "Unexpected response format from Gmail API for message %s: %s",
-                    msg_id,
-                    response,
-                )
-                return False
-
-        except Exception as e:
-            logger.error(
-                "Failed to update message %s with labels %s (IDs: %s) on attempt %d: %s",
+    if response and "labelIds" in response:
+        applied_labels = set(response["labelIds"])
+        if set(label_ids).issubset(applied_labels):
+            logger.debug(
+                "Labels applied to message %s:\nRequested: %s\nCurrent: %s",
                 msg_id,
                 label_names,
-                label_ids,
-                attempt + 1,
-                e,
-                exc_info=True,
+                response["labelIds"],
             )
-            if attempt == max_retries - 1:
-                return False
-            await asyncio.sleep(backoff)
-            backoff *= 2
-
+            return True
+        missing = set(label_ids) - applied_labels
+        logger.warning(
+            "Some requested labels missing on message %s: %s\nCurrent: %s",
+            msg_id,
+            list(missing),
+            response["labelIds"],
+        )
+        return False
+    logger.warning("Unexpected response for message %s: %s", msg_id, response)
     return False
 
 
-def parse_date(date_str: str) -> datetime:
-    """
-    Parses an RFC2822 date string into a datetime object.
-    """
-    dt = email.utils.parsedate_to_datetime(date_str)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+async def remove_empty_labels(aiogoogle: Aiogoogle) -> None:
+    """Remove any empty zola child labels; ensure system labels exist."""
+    gmail = await get_gmail_service(aiogoogle)
+    logger.info("Ensuring system-level labels exist")
+    await asyncio.gather(
+        get_or_create_label(aiogoogle, PARENT_LABEL),
+        get_or_create_label(aiogoogle, LLM_PARENT_LABEL),
+    )
+    async with rate_limiter:
+        response = await aiogoogle.as_user(gmail.users.labels.list(userId="me"))
 
-
-def extract_email_domain(header_value: str) -> str:
-    """
-    Extracts the email domain from a header string.
-    """
-    text_outside_brackets = re.sub(r"<[^>]*>", "", header_value)
-    if text_outside_brackets.count("@") > 1:
-        return "unknown"
-    match = EMAIL_REGEX.search(header_value)
-    return match.group(1).lower() if match else "unknown"
-
-
-def extract_message_part(msg: Dict[str, Any]) -> str:
-    """
-    Recursively walk through the email parts to find message body.
-    """
-    if not msg:
-        return ""
-    mime_type = msg.get("mimeType", "")
-    if mime_type.startswith("text/"):
-        if msg.get("filename"):
-            return ""
-        body_data = msg.get("body", {}).get("data")
-        if body_data:
-            try:
-                return decode_base64url(body_data).decode("utf-8", errors="replace")
-            except Exception as e:
-                logger.warning("Failed to decode message body: %s", e)
-                return ""
-    if "parts" in msg:
-        for part in msg["parts"]:
-            if part.get("mimeType") == "text/plain" and not part.get("filename"):
-                content = extract_message_part(part)
-                if content:
-                    return content
-        for part in msg["parts"]:
-            if part.get("mimeType") == "text/html" and not part.get("filename"):
-                content = extract_message_part(part)
-                if content:
-                    return content
-        for part in msg["parts"]:
-            if not part.get("filename"):
-                content = extract_message_part(part)
-                if content:
-                    return content
-    return ""
+    preserved = {PARENT_LABEL.lower(), LLM_PARENT_LABEL.lower()}
+    for label in response.get("labels", []):
+        name = label.get("name", "")
+        if name.lower().startswith(f"{PARENT_LABEL.lower()}/") and name.lower() not in preserved:
+            label_id = label.get("id")
+            async with rate_limiter:
+                messages_response = await aiogoogle.as_user(
+                    gmail.users.messages.list(userId="me", labelIds=[label_id], maxResults=1)
+                )
+            if not messages_response.get("messages"):
+                logger.info("Removing empty label: %s", name)
+                try:
+                    async with rate_limiter:
+                        await aiogoogle.as_user(gmail.users.labels.delete(userId="me", id=label_id))
+                except Exception as e:
+                    logger.warning("Failed to delete label %s: %s", name, e)
 
 
 async def get_email_body_markdown(
@@ -381,265 +427,149 @@ async def get_email_body_markdown(
     message: Dict[str, Any],
     include_attachment_content: bool = True,
 ) -> str:
-    """
-    Extracts the email body and attachments, converting everything to Markdown.
-    """
+    """Extract the email body, convert to Markdown, and optionally parse attachments."""
+    content = _extract_main_content(message)
+    content = await _convert_html_to_markdown(content, message)
+
+    if not include_attachment_content:
+        return content
+
+    attachments = get_message_attachments(message)
+    if not attachments:
+        return content
+
+    attachment_content = await _process_attachments(aiogoogle, message, attachments)
+    if not attachment_content:
+        return content
+
+    return f"{content}\n\n{attachment_content}"
+
+
+def _extract_main_content(message: Dict[str, Any]) -> str:
+    """Extract the main content from the message."""
     payload = message.get("payload", {})
     if not payload:
-        logger.debug("No payload found in message; falling back to snippet")
         return message.get("snippet", "").strip()
 
-    logger.debug(
-        "Message payload MIME type: %s; parts present: %s; headers: %s",
-        payload.get("mimeType", "unknown"),
-        bool(payload.get("parts")),
-        payload.get("headers", []),
-    )
-
-    content = extract_message_part(payload)
+    content = extract_text_content(payload)
     if not content:
-        logger.debug("No content extracted, falling back to snippet")
-        content = message.get("snippet", "").strip()
-        if not content:
-            return ""
+        return message.get("snippet", "").strip()
 
-    # If the content is HTML, convert it to Markdown using MarkItDown.
-    if payload.get("mimeType", "").startswith("text/html"):
-        logger.debug("Converting HTML content using MarkItDown")
-        md = MarkItDown()
-        # Write the HTML content to a temporary file.
-        with tempfile.NamedTemporaryFile(suffix=".html", delete=False, mode="w", encoding="utf-8") as tmp:
-            tmp.write(content)
-            tmp_path = tmp.name
-        result = md.convert(tmp_path)
-        if result and result.text_content:
-            content = result.text_content.strip()
-        os.remove(tmp_path)  # Remove the temporary file.
-
-    content_parts = [content]
-    attachments = get_message_attachments(message)
-    if attachments:
-        content_parts.append("\n## Attachments")
-        supported_mime_types = {
-            "application/pdf",
-            "application/msword",
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            "application/vnd.ms-excel",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            "application/vnd.ms-powerpoint",
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        }
-        for attachment in attachments:
-            content_parts.append(
-                f"- **{attachment['filename']}** ({attachment['mimeType']}, {attachment['size']} bytes)"
-            )
-            if include_attachment_content and (
-                attachment["mimeType"].startswith("text/") or attachment["mimeType"] in supported_mime_types
-            ):
-                try:
-                    logger.debug(
-                        "Processing attachment '%s' with MIME type '%s'",
-                        attachment["filename"],
-                        attachment["mimeType"],
-                    )
-                    attachment_data = None
-                    # Look for inline attachment data.
-                    if "parts" in payload:
-                        for part in payload["parts"]:
-                            if part.get("filename") == attachment["filename"] and part.get("body", {}).get("data"):
-                                logger.debug(
-                                    "Found inline attachment data for '%s'",
-                                    attachment["filename"],
-                                )
-                                attachment_data = decode_base64url(part["body"]["data"])
-                                break
-                    if not attachment_data and attachment.get("attachmentId"):
-                        logger.debug(
-                            "No inline data found; downloading attachment '%s' with ID '%s'",
-                            attachment["filename"],
-                            attachment.get("attachmentId"),
-                        )
-                        attachment_data = await get_attachment(aiogoogle, message["id"], attachment["attachmentId"])
-                    if attachment_data:
-                        logger.debug(
-                            "Attachment data length for '%s': %d bytes",
-                            attachment["filename"],
-                            len(attachment_data),
-                        )
-                        # Create a temporary file for the attachment.
-                        _, ext = os.path.splitext(attachment["filename"])
-                        if not ext:
-                            if attachment["mimeType"] == "application/pdf":
-                                ext = ".pdf"
-                        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-                            tmp.write(attachment_data)
-                            tmp.flush()
-                            temp_filename = tmp.name
-                        logger.debug(
-                            "Temporary file created for '%s': %s",
-                            attachment["filename"],
-                            temp_filename,
-                        )
-                        md = MarkItDown()
-                        logger.debug(
-                            "Starting MarkItDown conversion for attachment '%s' using tempfile",
-                            attachment["filename"],
-                        )
-                        result = md.convert(temp_filename)
-                        logger.debug(
-                            "MarkItDown conversion result for '%s': %s",
-                            attachment["filename"],
-                            result,
-                        )
-                        converted_text = result.text_content.strip() if (result and result.text_content) else ""
-                        logger.debug(
-                            "Converted text length for attachment '%s': %d",
-                            attachment["filename"],
-                            len(converted_text),
-                        )
-                        if converted_text:
-                            content_parts.append(f"\n```\n{converted_text}\n```")
-                        os.remove(temp_filename)
-                        logger.debug("Temporary file '%s' removed", temp_filename)
-                    else:
-                        logger.debug(
-                            "No attachment data found for '%s'",
-                            attachment["filename"],
-                        )
-                except Exception as e:
-                    logger.warning(
-                        "Failed to convert attachment %s (%s): %s",
-                        attachment["filename"],
-                        attachment["mimeType"],
-                        e,
-                    )
-
-    final_content = "\n\n".join(content_parts).strip()
-    logger.debug(
-        "Final Markdown content (length %d): %s",
-        len(final_content),
-        final_content,
-    )
-    return final_content
+    return content
 
 
-async def remove_empty_labels(aiogoogle: Aiogoogle) -> None:
-    """
-    First creates the system-level labels, then checks all zola labels and removes any that have no messages.
-    Preserves the special hierarchy labels even if empty.
-    """
-    gmail = await aiogoogle.discover("gmail", "v1")
+async def _convert_html_to_markdown(content: str, message: Dict[str, Any]) -> str:
+    """Convert HTML content to Markdown if needed using async file I/O."""
+    payload = message.get("payload", {})
+    if not payload.get("mimeType", "").startswith("text/html"):
+        return content
 
-    # First, ensure the system-level labels exist
-    logger.info("Creating system-level labels if needed")
-    await asyncio.gather(
-        get_or_create_label(aiogoogle, PARENT_LABEL),
-        get_or_create_label(aiogoogle, LLM_PARENT_LABEL),
-    )
+    md = MarkItDown()
+    # Use the asynchronous temporary file manager and aiofiles for non-blocking I/O
+    import aiofiles  # Import here if not already imported at the top
 
-    # Then proceed with cleaning up empty labels
-    response = await aiogoogle.as_user(gmail.users.labels.list(userId="me"))
-    preserved_labels = {
-        PARENT_LABEL.lower(),
-        LLM_PARENT_LABEL.lower(),
+    async with async_temporary_file(".html") as tmp_path:
+        async with aiofiles.open(tmp_path, "w", encoding="utf-8") as f:
+            await f.write(content)
+        # Offload the blocking conversion to a thread so as not to block the async loop.
+        result = await asyncio.to_thread(md.convert, str(tmp_path))
+
+    if result and result.text_content:
+        return result.text_content.strip()
+    return content
+
+
+async def _process_attachments(
+    aiogoogle: Aiogoogle,
+    message: Dict[str, Any],
+    attachments: List[Dict[str, Any]],
+) -> Optional[str]:
+    """Process message attachments and return formatted content."""
+    if not attachments:
+        return None
+
+    content_parts = ["## Attachments"]
+
+    for att in attachments:
+        attachment_info = _format_attachment_info(att)
+        content_parts.append(attachment_info)
+
+        attachment_content = await _get_attachment_content(aiogoogle, message, att)
+        if attachment_content:
+            content_parts.append(attachment_content)
+
+    return "\n\n".join(content_parts)
+
+
+def _format_attachment_info(attachment: Dict[str, Any]) -> str:
+    """Format basic attachment information."""
+    filename = attachment.get("filename")
+    mime = attachment.get("mimeType")
+    size = attachment.get("size")
+    return f"- **{filename}** ({mime}, {size} bytes)"
+
+
+async def _get_attachment_content(
+    aiogoogle: Aiogoogle,
+    message: Dict[str, Any],
+    attachment: Dict[str, Any],
+) -> Optional[str]:
+    """Extract and convert attachment content if supported."""
+    supported_mime = {
+        "application/pdf",
+        "application/msword",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-powerpoint",
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     }
-    for label in response.get("labels", []):
-        name = label.get("name", "")
-        if name.lower().startswith(f"{PARENT_LABEL.lower()}/"):
-            if name.lower() in preserved_labels:
-                continue
-            label_id = label.get("id")
-            messages_response = await aiogoogle.as_user(
-                gmail.users.messages.list(userId="me", labelIds=[label_id], maxResults=1)
-            )
-            if not messages_response.get("messages"):
-                logger.info("Removing empty label: %s", name)
-                try:
-                    await aiogoogle.as_user(gmail.users.labels.delete(userId="me", id=label_id))
-                except Exception as e:
-                    logger.warning("Failed to delete empty label %s: %s", name, e)
 
+    mime = attachment.get("mimeType")
+    if not (mime.startswith("text/") or mime in supported_mime):
+        return None
 
-def get_user_timezone() -> str:
-    """
-    Get the user's timezone. Tries multiple methods:
-      1. TZ environment variable
-      2. System timezone from /etc/timezone
-      3. Tries /etc/localtime symlink
-      4. Falls back to UTC if determination fails
-    """
-    tz = os.environ.get("TZ")
-    if tz:
-        try:
-            zoneinfo.ZoneInfo(tz)
-            return tz
-        except zoneinfo.ZoneInfoNotFoundError:
-            pass
     try:
-        with open("/etc/timezone") as f:
-            tz_candidate = f.read().strip()
-            if tz_candidate:
-                zoneinfo.ZoneInfo(tz_candidate)
-                return tz_candidate
-    except (FileNotFoundError, zoneinfo.ZoneInfoNotFoundError):
-        pass
-    try:
-        localtime = Path("/etc/localtime")
-        if localtime.exists():
-            target = os.path.realpath(localtime)
-            if "zoneinfo" in target:
-                tz_candidate = target.split("zoneinfo/")[-1].split("zoneinfo.default/")[-1]
-                tz_candidate = tz_candidate.lstrip("/")
-                if tz_candidate in zoneinfo.available_timezones():
-                    return tz_candidate
-    except (OSError, zoneinfo.ZoneInfoNotFoundError):
-        pass
-    logger.warning("Could not determine user timezone, falling back to UTC")
-    return "UTC"
+        data = await _get_attachment_data(aiogoogle, message, attachment)
+        if not data:
+            return None
+
+        return await _convert_attachment_to_markdown(data, attachment.get("filename", ""))
+    except Exception as e:
+        logger.warning("Failed to process attachment %s (%s): %s", attachment.get("filename"), mime, e)
+        return None
 
 
-def convert_to_user_timezone(dt: datetime) -> datetime:
-    """
-    Convert a datetime to the user's timezone.
-    """
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    user_tz = zoneinfo.ZoneInfo(get_user_timezone())
-    return dt.astimezone(user_tz)
+async def _get_attachment_data(
+    aiogoogle: Aiogoogle,
+    message: Dict[str, Any],
+    attachment: Dict[str, Any],
+) -> Optional[bytes]:
+    """Get attachment data either from payload or by downloading."""
+    filename = attachment.get("filename")
+    payload = message.get("payload", {})
+
+    # Check inline data first
+    for part in payload.get("parts", []):
+        if part.get("filename") == filename and part.get("body", {}).get("data"):
+            return decode_base64url(part["body"]["data"])
+
+    # Download if not found inline
+    if attachment.get("attachmentId"):
+        return await get_attachment(aiogoogle, message["id"], attachment["attachmentId"])
+
+    return None
 
 
-def format_datetime_for_model(dt: datetime) -> str:
-    """
-    Format a datetime in a consistent way for the model context.
-    """
-    local_dt = convert_to_user_timezone(dt)
-    return local_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+async def _convert_attachment_to_markdown(data: bytes, filename: str) -> Optional[str]:
+    """Convert attachment data to markdown format."""
+    with temporary_file(Path(filename).suffix or ".bin") as tmp_path:
+        with open(tmp_path, "wb") as f:
+            f.write(data)
 
+        md = MarkItDown()
+        result = md.convert(str(tmp_path))
+        if result and result.text_content.strip():
+            return f"\n```\n{result.text_content.strip()}\n```"
 
-def decode_base64url(data: str) -> bytes:
-    """
-    Decodes a base64url-encoded string, adding any missing padding.
-    """
-    if not data:
-        return b""
-    data = data.replace("-", "+").replace("_", "/")
-    missing_padding = len(data) % 4
-    if missing_padding:
-        data += "=" * (4 - missing_padding)
-    return base64.b64decode(data)
-
-
-class TempFileManager:
-    def __init__(self, suffix: str = None):
-        self.suffix = suffix
-        self.temp_file = None
-
-    def __enter__(self):
-        self.temp_file = tempfile.NamedTemporaryFile(mode="w+b", suffix=self.suffix, delete=False)
-        return self.temp_file.name
-
-    def __exit__(self, *_):
-        if self.temp_file:
-            self.temp_file.close()
-            if os.path.exists(self.temp_file.name):
-                os.remove(self.temp_file.name)
+    return None

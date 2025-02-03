@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "A Gmail classifier that labels messages using an LLM."
 requires-python = ">=3.12"
 
-dependencies = ["aiogoogle", "humanize", "markitdown", "mlx-lm", "rich", "tqdm"]
+dependencies = ["aiogoogle", "aiolimiter", "humanize", "markitdown", "mlx-lm", "rich", "tenacity", "tqdm"]
 
 [project.scripts]
 zola = "zola.main:main"

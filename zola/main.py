@@ -2,8 +2,9 @@ import argparse
 import asyncio
 import logging
 import sys
+import tracemalloc
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from rich.logging import RichHandler
 from rich.panel import Panel
@@ -14,36 +15,32 @@ from zola.gmail_utils import remove_empty_labels
 from zola.llm_utils import classify_email, load_llm
 from zola.processing import SLAData, process_inbox_folder, process_sent_folder
 
+tracemalloc.start(10)  # keep 10 frames of traceback
+logger = logging.getLogger(__name__)
+
 
 def setup_logging(log_level: str) -> None:
-    """
-    Configure logging with the specified level, using Rich for colored logging output.
-    """
     numeric_level = getattr(logging, log_level.upper(), None)
     if not isinstance(numeric_level, int):
         raise ValueError(f"Invalid log level: {log_level}")
 
     logging.basicConfig(
         level=numeric_level,
-        format="%(message)s",  # RichHandler handles formatting
+        format="%(message)s",
         datefmt="[%X]",
         handlers=[RichHandler(rich_tracebacks=True)],
     )
-
     logging.getLogger().setLevel(numeric_level)
 
 
 def check_credentials() -> None:
-    """
-    Verify that the application credentials exist in the expected location.
-    """
     creds_path = Path("secrets/credentials/application_credentials.json")
     if not creds_path.exists():
         console.print(
             Panel.fit(
                 (
                     f"[bold red]Error[/bold red]: OAuth credentials not found at [bold]{creds_path}[/bold]\n\n"
-                    "See the README.md for detailed instructions on setting up credentials."
+                    "See the README.md for instructions on setting up credentials."
                 ),
                 title="[bold red]Credentials Missing[/bold red]",
                 border_style="red",
@@ -53,17 +50,11 @@ def check_credentials() -> None:
 
 
 async def test_llm(model_identifier: str) -> Tuple:
-    """
-    Run a quick test of the LLM to ensure it's working.
-    Returns the loaded model and tokenizer if the test passes.
-    """
     console.print(Panel("Testing LLM installation...", style="bold magenta", expand=False))
-    with console.status("[bold magenta]Loading LLM model and tokenizer...") as status:
+    with console.status("[bold magenta]Loading LLM model and tokenizer..."):
         model, tokenizer = load_llm(model_identifier)
-        status.update("[bold magenta]Model loaded successfully. Preparing test classification...")
 
-        test_context = (
-            """
+    test_context = """
 User Context:
   User Name: Test User
   User Email: test@example.com
@@ -76,11 +67,10 @@ Email Metadata:
 
 Email Body (Markdown):
 This is a test email to verify the LLM is working.
-            """
-        ).strip()
+    """.strip()
 
-        status.update("[bold magenta]Running test classification...")
-        labels = await classify_email(test_context, model, tokenizer)
+    console.print("[bold magenta]Running test classification...[/bold magenta]")
+    labels = await classify_email(test_context, model, tokenizer)
 
     if "error" in labels:
         console.print(
@@ -102,16 +92,51 @@ This is a test email to verify the LLM is working.
     return model, tokenizer
 
 
+async def process_account(
+    account_mgr: AccountManager,
+    account_name: str,
+    llm_model: Any,
+    tokenizer: Any,
+    max_messages: int,
+) -> None:
+    """
+    Process a single Gmail account using the provided LLM model and tokenizer.
+    """
+    user_info = account_mgr.get_account(account_name)
+    console.print(
+        Panel(
+            f"[bold blue]Processing account:[/bold blue] [bold]{user_info.shortname} ({user_info.email})[/bold]",
+            title="Account Selection",
+            border_style="blue",
+        )
+    )
+    aiogoogle = await account_mgr.get_service(account_name)
+    async with aiogoogle:
+        console.print("[bold blue]Checking for empty labels...[/bold blue]")
+        await remove_empty_labels(aiogoogle)
+
+        sla_data = SLAData()
+        await process_sent_folder(aiogoogle, sla_data, max_messages)
+        await process_inbox_folder(
+            aiogoogle=aiogoogle,
+            llm_model=llm_model,
+            tokenizer=tokenizer,
+            sla_data=sla_data,
+            max_messages=max_messages,
+        )
+
+        if logging.getLogger().getEffectiveLevel() <= logging.DEBUG:
+            sla_data.print_debug_stats()
+
+
 async def async_main(
     max_messages: int,
     model_identifier: str,
     account_name: Optional[str] = None,
     skip_llm_test: bool = False,
 ) -> None:
-    # Verify that the credentials file exists.
     check_credentials()
 
-    # Load and (optionally) test the LLM.
     if not skip_llm_test:
         llm_model, tokenizer = await test_llm(model_identifier)
     else:
@@ -119,47 +144,17 @@ async def async_main(
 
     account_mgr = AccountManager()
 
-    # Get list of accounts to process
     if account_name is None:
         account_names = account_mgr.get_account_names()
         if not account_names:
-            # If no accounts exist, prompt to create one
-            account_name, aiogoogle = await account_mgr.select_account()
+            account_name, _ = await account_mgr.select_account()
             account_names = [account_name]
     else:
         account_names = [account_name]
 
-    # Process each account
-    for account_name in account_names:
-        console.print(
-            Panel(
-                f"[bold blue]Processing account:[/bold blue] [bold]{account_name}[/bold]",
-                title="Account Selection",
-                border_style="blue",
-            )
-        )
-
-        aiogoogle = await account_mgr.get_service(account_name)
-        async with aiogoogle:  # Ensure proper session management
-            console.print("[bold blue]Checking for empty labels...[/bold blue]")
-            await remove_empty_labels(aiogoogle)
-
-            # Process the sent messages to build SLA data.
-            sla_data = SLAData()
-            await process_sent_folder(aiogoogle, sla_data, max_messages)
-
-            # Process the inbox messages
-            await process_inbox_folder(
-                aiogoogle=aiogoogle,
-                llm_model=llm_model,
-                tokenizer=tokenizer,
-                sla_data=sla_data,
-                max_messages=max_messages,
-            )
-
-            # If in debug mode, print additional SLA statistics.
-            if logging.getLogger().getEffectiveLevel() <= logging.DEBUG:
-                sla_data.print_debug_stats()
+    # Process accounts sequentially (or use asyncio.gather for concurrency)
+    for account in account_names:
+        await process_account(account_mgr, account, llm_model, tokenizer, max_messages)
 
     console.print(Panel("[bold green]All done![/bold green]", border_style="green"))
 

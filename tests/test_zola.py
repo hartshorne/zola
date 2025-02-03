@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import Dict, List
 from unittest.mock import AsyncMock, patch
 
+from zola.account_manager import UserInfo
 from zola.gmail_utils import (
     convert_to_user_timezone,
     extract_email_domain,
@@ -137,6 +138,9 @@ class TestLLMUtils(unittest.IsolatedAsyncioTestCase):
                 def decode(self, tokens, skip_special_tokens=True):
                     return "test"
 
+                def __getattr__(self, name):
+                    return lambda *args, **kwargs: None
+
             test_cases = [
                 ('["priority", "respond"]', ["priority", "respond"]),
                 ("not a valid python list", [f"{LLM_PARENT_LABEL}/confused"]),
@@ -165,26 +169,33 @@ class TestLLMUtils(unittest.IsolatedAsyncioTestCase):
 
 class TestGmailRateLimiting(unittest.IsolatedAsyncioTestCase):
     async def test_rate_limiter(self):
-        from zola.gmail_utils import RateLimiter
+        from aiolimiter import AsyncLimiter
 
-        limiter = RateLimiter(max_calls=10, period=1.0)
+        # Test basic rate limiting
+        limiter = AsyncLimiter(max_rate=1, time_period=1.0)  # 1 request per second
         start_time = time.monotonic()
-        for _ in range(5):
+
+        # This should take at least 2 seconds for 3 requests at 1/sec
+        for _ in range(3):
             async with limiter:
                 pass
+
         elapsed = time.monotonic() - start_time
-        self.assertGreaterEqual(elapsed, 0.4, "Rate limiter didn't properly space out requests")
+        self.assertGreaterEqual(elapsed, 2.0, "Rate limiter didn't properly space out requests")
+
+        # Test concurrent requests
         start_time = time.monotonic()
 
         async def make_request():
             async with limiter:
                 return True
 
-        tasks = [make_request() for _ in range(20)]
+        # 3 concurrent requests should take at least 2 seconds at 1/sec
+        tasks = [make_request() for _ in range(3)]
         results = await asyncio.gather(*tasks)
         elapsed = time.monotonic() - start_time
-        self.assertGreaterEqual(elapsed, 1.0, "Rate limiter didn't properly handle concurrent requests")
-        self.assertEqual(len(results), 20, "Not all requests completed")
+        self.assertGreaterEqual(elapsed, 2.0, "Rate limiter didn't properly handle concurrent requests")
+        self.assertEqual(len(results), 3, "Not all requests completed")
         self.assertTrue(all(results), "Some requests failed")
 
 
@@ -419,7 +430,7 @@ class TestProcessing(unittest.IsolatedAsyncioTestCase):
                 "body": {"data": "Test body"},
             },
         }
-        mock_get_user_info.return_value = ("Test User", "test@example.com")
+        mock_get_user_info.return_value = UserInfo(shortname="test", name="Test User", email="test@example.com")
 
         class MockSLAData:
             def get_sla_categories(self, sender, domain):

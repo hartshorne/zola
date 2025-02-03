@@ -5,17 +5,39 @@ import os
 import socket
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from threading import Thread
 from pathlib import Path
-from typing import Dict, Tuple
+from threading import Thread
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
-from aiogoogle.client import Aiogoogle
+import aiofiles  # Added for async file operations
 from aiogoogle.auth.creds import UserCreds
+from aiogoogle.client import Aiogoogle
 
 from zola.settings import SCOPES
 
 logger = logging.getLogger(__name__)
+
+
+class UserInfo:
+    """Represents a Gmail account user's information."""
+
+    def __init__(self, shortname: str, name: str, email: str):
+        self.shortname = shortname
+        self.name = name
+        self.email = email
+
+    @classmethod
+    def from_dict(cls, shortname: str, data: Dict[str, str]) -> "UserInfo":
+        """Create a UserInfo instance from account data dictionary."""
+        return cls(shortname=shortname, name=data.get("name", "User"), email=data.get("email", ""))
+
+    def to_dict(self) -> Dict[str, str]:
+        """Convert to dictionary for storage."""
+        return {"name": self.name, "email": self.email}
+
+    def __str__(self) -> str:
+        return f"{self.shortname} ({self.email} - {self.name})"
 
 
 class OAuthCallbackHandler(BaseHTTPRequestHandler):
@@ -81,83 +103,85 @@ class AccountManager:
         self.accounts_file = os.path.join(self.config_dir, "accounts.json")
         self.credentials_dir = os.path.join(self.config_dir, "credentials")
         self._ensure_dirs_exist()
-        self.accounts = self._load_accounts()
+        self._accounts: Dict[str, UserInfo] = {}
+        self._load_accounts()
 
     def _ensure_dirs_exist(self) -> None:
         Path(self.config_dir).mkdir(parents=True, exist_ok=True)
         Path(self.credentials_dir).mkdir(parents=True, exist_ok=True)
 
-    def _load_accounts(self) -> Dict[str, str]:
+    def _load_accounts(self) -> None:
         if os.path.exists(self.accounts_file):
             with open(self.accounts_file, "r") as f:
-                return json.load(f)
-        return {}
+                data = json.load(f)
+                self._accounts = {
+                    shortname: UserInfo.from_dict(shortname, account_data) for shortname, account_data in data.items()
+                }
 
     def _save_accounts(self) -> None:
         with open(self.accounts_file, "w") as f:
-            json.dump(self.accounts, f, indent=2)
+            data = {shortname: info.to_dict() for shortname, info in self._accounts.items()}
+            json.dump(data, f, indent=2)
 
-    def get_account_names(self) -> list[str]:
-        return list(self.accounts.keys())
+    def get_account_names(self) -> List[str]:
+        return list(self._accounts.keys())
 
-    def add_account(self, name: str, email: str, user_name: str) -> None:
-        self.accounts[name] = {"email": email, "name": user_name}
+    def get_account(self, shortname: str) -> Optional[UserInfo]:
+        return self._accounts.get(shortname)
+
+    def add_account(self, shortname: str, email: str, name: str) -> UserInfo:
+        user_info = UserInfo(shortname=shortname, name=name, email=email)
+        self._accounts[shortname] = user_info
         self._save_accounts()
+        return user_info
 
     async def select_account(self) -> Tuple[str, Aiogoogle]:
-        """
-        Interactive account selection.
-        Returns a tuple (account_name, Gmail API service instance).
-        """
+        """Interactive account selection. Returns a tuple (account_name, Gmail API service instance)."""
         accounts = self.get_account_names()
 
         if not accounts:
             print("No accounts configured. Let's set up your first account.")
-            name = input("Enter a name for this account (e.g. 'work' or 'personal'): ").strip()
+            shortname = input("Enter a name for this account (e.g. 'work' or 'personal'): ").strip().lower()
             email = input("Enter the Gmail address: ").strip()
-            user_name = input("Enter your name (for email classification): ").strip()
-            self.add_account(name, email, user_name)
-            return name, await self.get_service(name)
+            name = input("Enter your name (for email classification): ").strip()
+            self.add_account(shortname, email, name)
+            return shortname, await self.get_service(shortname)
 
         if len(accounts) == 1:
-            name = accounts[0]
-            return name, await self.get_service(name)
+            shortname = accounts[0]
+            return shortname, await self.get_service(shortname)
 
         print("\nAvailable accounts:")
-        for i, name in enumerate(accounts, 1):
-            print(f"{i}. {name} ({self.accounts[name]['email']} - {self.accounts[name]['name']})")
+        for i, shortname in enumerate(accounts, 1):
+            user_info = self._accounts[shortname]
+            print(f"{i}. {user_info}")
         print(f"{len(accounts) + 1}. Add new account")
 
         while True:
             try:
                 choice = int(input("\nSelect an account (enter number): "))
                 if 1 <= choice <= len(accounts):
-                    name = accounts[choice - 1]
-                    return name, await self.get_service(name)
+                    shortname = accounts[choice - 1]
+                    return shortname, await self.get_service(shortname)
                 elif choice == len(accounts) + 1:
-                    name = input("Enter a name for the new account (e.g. 'work' or 'personal'): ").strip()
+                    shortname = input("Enter a name for the new account (e.g. 'work' or 'personal'): ").strip().lower()
                     email = input("Enter the Gmail address: ").strip()
-                    user_name = input("Enter your name (for email classification): ").strip()
-                    self.add_account(name, email, user_name)
-                    return name, await self.get_service(name)
+                    name = input("Enter your name (for email classification): ").strip()
+                    self.add_account(shortname, email, name)
+                    return shortname, await self.get_service(shortname)
             except (ValueError, IndexError):
                 print("Invalid choice. Please try again.")
 
-    async def get_service(self, account_name: str) -> Aiogoogle:
-        """
-        Get Gmail API service for the specified account.
-        If the account doesn't exist, guides the user through creating it.
-        Loads stored token if it exists, otherwise initiates OAuth flow.
-        """
-        if account_name not in self.accounts:
-            logger.info("Account '%s' not found. Let's set it up.", account_name)
-            email = input(f"Enter the Gmail address for '{account_name}': ").strip()
-            user_name = input("Enter your name (for email classification): ").strip()
-            self.add_account(account_name, email, user_name)
+    async def get_service(self, shortname: str) -> Aiogoogle:
+        """Get Gmail API service for the specified account."""
+        user_info = self.get_account(shortname)
+        if user_info is None:
+            logger.info("Account '%s' not found. Let's set it up.", shortname)
+            email = input(f"Enter the Gmail address for '{shortname}': ").strip()
+            name = input("Enter your name (for email classification): ").strip()
+            user_info = self.add_account(shortname, email, name)
 
-        account_info = self.accounts[account_name]
-        email = account_info["email"]
-        token_path = os.path.join(self.credentials_dir, f"{email}_token.json")
+        token_path = os.path.join(self.credentials_dir, f"{user_info.email}_token.json")
         credentials_path = os.path.join(self.credentials_dir, "application_credentials.json")
 
         logger.debug("Looking for credentials at: %s", credentials_path)
@@ -169,15 +193,17 @@ class AccountManager:
                 f"and save them to {credentials_path}"
             )
 
-        with open(credentials_path) as f:
-            client_creds = json.load(f)
+        async with aiofiles.open(credentials_path, "r") as f:
+            content = await f.read()
+            client_creds = json.loads(content)
             logger.debug("Loaded client credentials: %s", json.dumps(client_creds, indent=2))
 
         user_creds = None
         if os.path.exists(token_path):
             logger.debug("Found existing token file")
-            with open(token_path) as f:
-                creds_data = json.load(f)
+            async with aiofiles.open(token_path, "r") as f:
+                content = await f.read()
+                creds_data = json.loads(content)
                 logger.debug("Loaded token data: %s", json.dumps(creds_data, indent=2))
                 user_creds = UserCreds(
                     access_token=creds_data["access_token"],
@@ -231,7 +257,7 @@ class AccountManager:
 
                 auth_url = aiogoogle.oauth2.authorization_url(scopes=SCOPES)
                 logger.debug("Generated auth URL: %s", auth_url)
-                print(f"\nAuthorization required for Gmail access for account '{account_name}' ({email}).")
+                print(f"\nAuthorization required for Gmail access for account '{shortname}' ({user_info.email}).")
                 input("Press Enter to open your browser for Gmail authorization...")
                 code = await get_auth_code(auth_url, port)
                 logger.debug("Received auth code")
@@ -244,9 +270,9 @@ class AccountManager:
                 "expiry": user_creds.expires_at,
                 "scopes": user_creds.scopes,
             }
-            logger.debug("Saving token data: %s", json.dumps(token_data, indent=2))
-            with open(token_path, "w") as f:
-                json.dump(token_data, f, indent=2)
+            async with aiofiles.open(token_path, "w") as f:
+                await f.write(json.dumps(token_data, indent=2))
+            logger.debug("Saved token data.")
 
         logger.debug(
             "Creating final Aiogoogle instance with user_creds: %s",
