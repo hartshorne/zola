@@ -16,21 +16,33 @@ MAX_INPUT_TOKENS = 8192
 ERROR_LABELS = {
     f"{LLM_PARENT_LABEL}/error": "When LLM processing fails with an exception",
     f"{LLM_PARENT_LABEL}/confused": "When LLM cannot confidently apply standard labels",
-    f"{LLM_PARENT_LABEL}/timeout": "When LLM processing times out",
+    # Removed the "timeout" label
 }
 
 # All standard labels for classification
 STANDARD_LABELS = {
     "priority": (
         "For emails needing immediate attention. This may include urgent messages, near-due bills, quick meeting invites, "
-        "critical requests, travel bookings needing attention, or emails from key contacts and familiar senders (`{sender_category}`/`{user_family_name}`)."
+        "critical requests, travel bookings needing attention, emails requiring an immediate signature, "
+        "or emails from key contacts and familiar senders (`{sender_category}`/`{user_family_name}`)."
     ),
-    "respond": "For emails that need a reply or follow-up; can also be 'priority' if urgent.",
+    "respond": (
+        "For emails that need a reply or follow-up; can also be 'priority' if urgent. "
+        "This includes requests for signatures that aren't time-critical."
+    ),
     "review": "For emails to be read or reviewed later; not urgent and not requiring a response.",
     "finance": "For financial matters such as invoices, bills, expenses, and taxes; can be 'priority' if urgent.",
     "travel": "For travel-related emails like bookings, itineraries, and confirmations; use 'priority' if time-sensitive.",
     "school": "For school communications including updates, announcements, and deadlines; mark as 'priority' if urgent.",
     "newsletters": "For regular updates such as newsletters and informational digests.",
+    "notifications": (
+        "For system-generated notifications such as terms of service updates, privacy policy changes, or service alerts. "
+        "These emails are informational and typically do not require immediate action."
+    ),
+    "completed": (
+        "For emails that indicate that a task or conversation is finished. "
+        "This may include thank-you notes, confirmations, or other acknowledgements where no further action is needed."
+    ),
     "ignore": (
         "For low-priority bulk emails like sales outreach, surveys, promotional content, or automated notifications. "
         "When this label is applied, no other labels should be used."
@@ -97,18 +109,25 @@ SLA_SECTION = generate_sla_markdown(SLA_CATEGORIES)
 
 # LLM prompt template that uses the labels markdown and SLA explanation
 LLM_CONTEXT_TEMPLATE = f"""You are an elite executive assistant helping to organize an inbox using a simple but effective labeling system.
-Your task is to analyze each email and apply one or more of these labels relevant to prioritizing the email:
+Your task is to analyze each email and apply **exactly one** of these labels:
 
-Available labels (apply multiple if needed):
+Available labels:
 {LABELS_SECTION}
 
 SLA Details:
 {SLA_SECTION}
 
-Priority Guidelines:
+**Priority and Consistency Guidelines**:
 - Consider today's date ({{today_date}}) when assessing urgency.
 - Emails from people with your family name ({{user_family_name}}) should be high priority.
 - Evaluate typical response times ({{sender_category}}) as well as domain-level patterns ({{domain_category}}).
+- Carefully consider if the email seems to be from a human or an automated system. Human messages often warrant 'respond' or 'priority' labels, while automated messages typically go to 'ignore' or 'newsletters' unless they require urgent attention.
+- Sales outreach messages should be labeled as 'ignore', even if they appear to be from a human sender.
+- Emails that are clearly system-generated notifications (e.g., terms of service updates, privacy policy changes, or service alerts) should be labeled as 'notifications'.
+- Emails that signal a completed task or conversation—such as thank-you notes, confirmations, or acknowledgements where no further action is needed—should be labeled as 'completed'.
+- The CEO prefers to process similar tasks from the same sender together, so try to categorize all emails from the same sender in a consistent manner.
+- For requests involving signatures, mark them as 'respond' if non-urgent, or 'priority' if the signature is time-sensitive.
+- If you are uncertain or if multiple labels seem close, choose the single label that makes the most sense.
 
 Email Context (provided solely for analysis):
   From: {{from_header}}
@@ -120,8 +139,9 @@ Email Context (provided solely for analysis):
 Email Body:
 {{email_body}}
 
-**IMPORTANT**: Do not include or echo any part of the email context or body in your response.
-Return ONLY a Python list of labels, for example: ['priority', 'finance'].
+**IMPORTANT**:
+- Do not include or echo any part of the email context or body in your response.
+- Return ONLY a Python list containing exactly one label, for example: ['priority'].
 """
 
 # Default SLA in seconds (1 hour)

@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import csv
 import logging
 import threading
 from typing import Any, List, Tuple
@@ -113,6 +114,10 @@ async def classify_email(context: str, model: Any, tokenizer: Any) -> List[str]:
         result: str = await asyncio.to_thread(safe_mlx_generate, model, tokenizer, context, False)
     except Exception:
         logger.exception("LLM generation failed")
+        # Log the error case to error.tsv
+        with open("error.tsv", "a", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f, delimiter="\t")
+            writer.writerow([context, "", [f"{LLM_PARENT_LABEL}/error"]])
         return [f"{LLM_PARENT_LABEL}/error"]
 
     raw_labels = parse_llm_output(result)
@@ -122,4 +127,8 @@ async def classify_email(context: str, model: Any, tokenizer: Any) -> List[str]:
         return valid_labels
     else:
         logger.warning("No valid labels found in LLM output: %s", result)
+        # Log the confused case to confused.tsv
+        with open("confused.tsv", "a", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f, delimiter="\t")
+            writer.writerow([context, result, raw_labels])
         return [f"{LLM_PARENT_LABEL}/confused"]
