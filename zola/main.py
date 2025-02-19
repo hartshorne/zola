@@ -143,6 +143,8 @@ async def async_main(
         llm_model, tokenizer = load_llm(model_identifier)
 
     account_mgr = AccountManager()
+    # Wait for account validation to complete before proceeding
+    await account_mgr.validate_all_accounts()
 
     if account_name is None:
         account_names = account_mgr.get_account_names()

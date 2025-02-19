@@ -13,10 +13,13 @@ from urllib.parse import parse_qs, urlparse
 import aiofiles  # Added for async file operations
 from aiogoogle.auth.creds import UserCreds
 from aiogoogle.client import Aiogoogle
+from rich.console import Console
+from rich.panel import Panel
 
 from zola.settings import SCOPES
 
 logger = logging.getLogger(__name__)
+console = Console()
 
 
 class UserInfo:
@@ -181,7 +184,7 @@ class AccountManager:
             name = input("Enter your name (for email classification): ").strip()
             user_info = self.add_account(shortname, email, name)
 
-        token_path = os.path.join(self.credentials_dir, f"{user_info.email}_token.json")
+        token_path = self._get_token_path(user_info)
         credentials_path = os.path.join(self.credentials_dir, "application_credentials.json")
 
         logger.debug("Looking for credentials at: %s", credentials_path)
@@ -279,3 +282,71 @@ class AccountManager:
             "yes" if user_creds else "no",
         )
         return Aiogoogle(client_creds=auth_creds, user_creds=user_creds)
+
+    def _get_token_path(self, user_info: UserInfo) -> str:
+        """Return the path to the token file for a given user."""
+        return os.path.join(self.credentials_dir, f"{user_info.email}_token.json")
+
+    def _prompt_reauthorization(self, shortname: str, user_info: UserInfo) -> bool:
+        """Prompt the user to decide if they want to reauthorize the account."""
+        return (
+            input(f"Would you like to reauthorize account '{shortname}' ({user_info.email}) now? (y/n): ")
+            .lower()
+            .strip()
+            == "y"
+        )
+
+    async def _validate_account(self, shortname: str) -> None:
+        """Validate a single account and handle reauthorization prompt on failure."""
+        user_info = self.get_account(shortname)
+        if not user_info:
+            logger.error(f"Account '{shortname}' not found")
+            return
+        try:
+            logger.info(f"Validating account '{shortname}' ({user_info.email})")
+            await self.get_service(shortname)
+            logger.info(f"Successfully validated account '{shortname}'")
+        except Exception as e:
+            logger.error(f"Failed to validate account '{shortname}': {e}")
+            print(f"\nAccount '{shortname}' ({user_info.email}) needs to be reauthorized.")
+            if self._prompt_reauthorization(shortname, user_info):
+                try:
+                    await self.reauthorize_account(shortname)
+                    print(f"Successfully reauthorized account '{shortname}'")
+                except Exception as re_auth_error:
+                    logger.error(f"Failed to reauthorize account '{shortname}': {re_auth_error}")
+                    print(f"Failed to reauthorize account '{shortname}'. Please try again later.")
+
+    async def validate_all_accounts(self) -> None:
+        """Validate all configured accounts and refresh/reauthorize as needed."""
+        logger.info("Validating all configured accounts...")
+        console.print(Panel.fit("[yellow]Checking all Gmail accounts...", title="Zola"))
+
+        accounts = self.get_account_names()
+        with console.status("[bold green]Validating accounts...") as status:
+            for shortname in accounts:
+                await self._validate_account(shortname)
+
+        console.print(
+            Panel.fit(
+                f"[green]✓[/green] Checked {len(accounts)} Gmail account{'s' if len(accounts) != 1 else ''}",
+                title="Zola",
+                border_style="green",
+            )
+        )
+        logger.info("Finished validating all accounts")
+
+    async def reauthorize_account(self, shortname: str) -> None:
+        """Explicitly reauthorize an account by clearing existing credentials and starting fresh."""
+        user_info = self.get_account(shortname)
+        if not user_info:
+            raise ValueError(f"Account '{shortname}' not found")
+
+        token_path = self._get_token_path(user_info)
+        if os.path.exists(token_path):
+            logger.info(f"Removing existing token file for '{shortname}'")
+            os.remove(token_path)
+
+        logger.info(f"Starting reauthorization flow for '{shortname}' ({user_info.email})")
+        await self.get_service(shortname)  # This will trigger the full auth flow
+        logger.info(f"Successfully reauthorized account '{shortname}'")
