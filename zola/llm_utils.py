@@ -45,13 +45,10 @@ def load_llm(model_identifier: str) -> Tuple[Any, Any]:
 
     console.print(
         Panel.fit(
-            f"[bold blue]Model Information[/bold blue]\n\n"
-            f"Model: [cyan]{model_identifier}[/cyan]\n"
-            f"Context Window: [cyan]{actual_length:,}[/cyan] tokens"
-            + (f" (capped from {raw_length:,})" if raw_length > actual_length else "")
-            + "\n"
-            f"Vocab Size: [cyan]{len(tokenizer.vocab):,}[/cyan] tokens",
-            title="[bold blue]Model Statistics[/bold blue]",
+            f"[bold blue]✨ Zola is ready with[/bold blue]\n\n"
+            f"[cyan]{model_identifier.split('/')[-1]}[/cyan]\n"
+            f"Ready to process up to [cyan]{actual_length:,}[/cyan] tokens per email",
+            title="[bold blue]AI Assistant Ready[/bold blue]",
             border_style="blue",
         )
     )

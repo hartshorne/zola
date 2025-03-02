@@ -86,12 +86,41 @@ async def get_auth_code(auth_url: str, port: int) -> str:
     server_thread.daemon = True
     server_thread.start()
 
+    # Get the current status context if it exists
+    status_context = getattr(console, "_live", None)
+
+    # Pause status spinner if active
+    if status_context:
+        status_context.stop()
+
+    # Ask for confirmation before opening browser
+    console.print("\n[blue]I'll need to open your web browser to reconnect to Gmail.[/blue]")
+    console.print("[dim]You'll be asked to sign in and grant permission to access your email.[/dim]")
+    response = input("\nPress Enter to continue or type 'skip' to cancel this account: ")
+
+    # Resume status spinner if it was active
+    if status_context:
+        status_context.start()
+
+    if response.lower().strip() == "skip":
+        server.shutdown()
+        server.server_close()
+        server_thread.join()
+        raise ValueError("User canceled authentication process")
+
     # Open browser
+    console.print("[green]Opening your browser...[/green]")
     webbrowser.open(auth_url)
+    console.print("[yellow]Please complete the authentication in your browser.[/yellow]")
 
     # Wait for the authorization code
+    waiting_dots = 0
     while OAuthCallbackHandler.auth_code is None:
+        waiting_dots = (waiting_dots % 3) + 1
+        console.print(f"[yellow]Waiting for authentication{('.' * waiting_dots):<3}[/yellow]", end="\r")
         await asyncio.sleep(1)
+
+    console.print("\n[green]✓ Authentication successful![/green]")
 
     server.shutdown()
     server.server_close()
@@ -308,28 +337,68 @@ class AccountManager:
             logger.info(f"Successfully validated account '{shortname}'")
         except Exception as e:
             logger.error(f"Failed to validate account '{shortname}': {e}")
-            print(f"\nAccount '{shortname}' ({user_info.email}) needs to be reauthorized.")
-            if self._prompt_reauthorization(shortname, user_info):
+
+            # Check if this is an authentication error
+            if "invalid_grant" in str(e):
+                console.print(
+                    Panel.fit(
+                        f"[yellow]Gmail authentication has expired for your [bold]{shortname}[/bold] account ({user_info.email}).[/yellow]\n"
+                        f"[dim]This happens periodically and is normal.[/dim]",
+                        title="[yellow]Authentication Needed[/yellow]",
+                        border_style="yellow",
+                    )
+                )
+
                 try:
+                    console.print(f"[blue]Let's reconnect your [bold]{shortname}[/bold] account...[/blue]")
                     await self.reauthorize_account(shortname)
-                    print(f"Successfully reauthorized account '{shortname}'")
+                    console.print(
+                        Panel.fit(
+                            f"[green]✓ Successfully reconnected to [bold]{shortname}[/bold]![/green]",
+                            border_style="green",
+                        )
+                    )
+                except ValueError as skip_err:
+                    if "User canceled" in str(skip_err):
+                        console.print(f"[yellow]Skipping account '{shortname}'[/yellow]")
+                    else:
+                        raise
                 except Exception as re_auth_error:
                     logger.error(f"Failed to reauthorize account '{shortname}': {re_auth_error}")
-                    print(f"Failed to reauthorize account '{shortname}'. Please try again later.")
+                    console.print(
+                        Panel.fit(
+                            f"[red]I couldn't reconnect to your [bold]{shortname}[/bold] account.[/red]\n\n"
+                            f"Error: {str(re_auth_error).strip()}\n\n"
+                            f"[dim]Please try again later or check your network connection.[/dim]",
+                            title="[red]⚠️ Reconnection Failed[/red]",
+                            border_style="red",
+                        )
+                    )
+            else:
+                # For other errors
+                console.print(
+                    Panel.fit(
+                        f"[red]There was a problem with your [bold]{shortname}[/bold] account ({user_info.email}).[/red]\n\n"
+                        f"Error: {str(e).strip()}\n\n"
+                        f"[dim]Please try again later or check your network connection.[/dim]",
+                        title="[red]⚠️ Account Issue[/red]",
+                        border_style="red",
+                    )
+                )
 
     async def validate_all_accounts(self) -> None:
         """Validate all configured accounts and refresh/reauthorize as needed."""
         logger.info("Validating all configured accounts...")
-        console.print(Panel.fit("[yellow]Checking all Gmail accounts...", title="Zola"))
+        console.print(Panel.fit("🔑 Checking your email accounts...", title="Zola", border_style="yellow"))
 
         accounts = self.get_account_names()
-        with console.status("[bold green]Validating accounts...") as status:
+        with console.status("[bold green]Connecting to your accounts...") as status:
             for shortname in accounts:
                 await self._validate_account(shortname)
 
         console.print(
             Panel.fit(
-                f"[green]✓[/green] Checked {len(accounts)} Gmail account{'s' if len(accounts) != 1 else ''}",
+                f"[green]✓[/green] Connected to {len(accounts)} email account{'s' if len(accounts) != 1 else ''}",
                 title="Zola",
                 border_style="green",
             )
